@@ -12,6 +12,7 @@
 #include <atomic>
 #include <chrono>
 #include <stdexcept>
+#include <algorithm>
 #include <random>
 
 // ------------------------------------------------------------
@@ -21,6 +22,7 @@ std::atomic<bool> stop_flag(false);
 std::atomic<long long> total_requests_completed(0);
 std::atomic<long long> total_response_time_us(0);
 std::atomic<long long> total_errors(0);
+std::atomic<long long> total_not_found(0);
 
 enum class WorkloadType
 {
@@ -71,21 +73,28 @@ void client_worker(
             switch (workload)
             {
             case WorkloadType::GET_POPULAR:
+            {
                 is_get = true;
-
-                // 80% of GETs hit the "hot" 10 keys of thread 0
-                std::uniform_int_distribution<> hot_dist(0, 9);
-                std::uniform_int_distribution<> cold_dist(10, std::max(10, max_keys_per_put_thread - 1));
-                double p_hot = 0.8; // 80% requests to hot keys
-
-                double p = prob(gen);
-                int key_id = (p < p_hot) ? hot_dist(gen) : cold_dist(gen);
-
-                // Use keys from thread 0's PUTs to ensure existence
-                key = "key_put_0_" + std::to_string(key_id);
+                int hot_count = std::min(10, max_keys_per_put_thread);
+                // If there are fewer than 11 keys total, just pick uniformly from available keys
+                if (max_keys_per_put_thread <= hot_count)
+                {
+                    std::uniform_int_distribution<> all_dist(0, std::max(0, max_keys_per_put_thread - 1));
+                    int key_id = all_dist(gen);
+                    key = "key_put_0_" + std::to_string(key_id);
+                }
+                else
+                {
+                    std::uniform_int_distribution<> hot_dist(0, hot_count - 1);
+                    std::uniform_int_distribution<> cold_dist(hot_count, max_keys_per_put_thread - 1);
+                    double p_hot = 0.8;
+                    double p = prob(gen);
+                    int key_id = (p < p_hot) ? hot_dist(gen) : cold_dist(gen);
+                    key = "key_put_0_" + std::to_string(key_id);
+                }
                 res = client.Get("/kv/" + key);
                 break;
-
+            }
             case WorkloadType::GET_ALL:
             {
                 is_get = true;
@@ -97,15 +106,14 @@ void client_worker(
             }
 
             case WorkloadType::PUT_ALL:
+            {
                 key = "key_put_" + std::to_string(thread_id) + "_" + std::to_string(per_thread_request_counter++);
-                {
-                    httplib::Params params;
-                    params.emplace("key", key);
-                    params.emplace("val", val);
-                    res = client.Post("/kv", params);
-                }
+                httplib::Params params;
+                params.emplace("key", key);
+                params.emplace("val", val);
+                res = client.Post("/kv", params);
                 break;
-
+            }
             case WorkloadType::MIXED:
             {
                 double p = prob(gen);
@@ -133,17 +141,30 @@ void client_worker(
 
             auto end_time = std::chrono::steady_clock::now();
 
-            if (res && (res->status == 200 || res->status == 201 || res->status == 404))
+            if (res)
             {
-                auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
-
-                auto now = std::chrono::steady_clock::now();
-                auto since_start = std::chrono::duration_cast<std::chrono::seconds>(now - test_start).count();
-
-                if (since_start >= warmup_sec)
+                if (res->status == 200 || res->status == 201)
                 {
-                    total_requests_completed.fetch_add(1, std::memory_order_relaxed);
-                    total_response_time_us.fetch_add(elapsed_us, std::memory_order_relaxed);
+                    // successful
+                    auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+                    auto now = std::chrono::steady_clock::now();
+                    auto since_start = std::chrono::duration_cast<std::chrono::seconds>(now - test_start).count();
+
+                    if (since_start >= warmup_sec)
+                    {
+                        total_requests_completed.fetch_add(1, std::memory_order_relaxed);
+                        total_response_time_us.fetch_add(elapsed_us, std::memory_order_relaxed);
+                    }
+                }
+                else if (res->status == 404)
+                {
+                    // not found (count separately)
+                    total_not_found.fetch_add(1, std::memory_order_relaxed);
+                }
+                else
+                {
+                    // other error status (5xx etc)
+                    total_errors.fetch_add(1, std::memory_order_relaxed);
                 }
             }
             else
@@ -206,7 +227,7 @@ int main(int argc, char *argv[])
     }
     else if (workload_str == "MIXED")
     {
-        if (argc < 9)
+        if (argc < 10)
         {
             std::cerr << "Error: MIXED requires [num_put_threads] [max_keys_per_put_thread] [get_ratio put_ratio]" << std::endl;
             return 1;
@@ -225,6 +246,19 @@ int main(int argc, char *argv[])
 
     const int warmup_sec = 5;
     const int total_runtime_sec = duration_sec + warmup_sec;
+
+    if ((workload == WorkloadType::GET_ALL || workload == WorkloadType::MIXED) && num_put_threads <= 0) {
+        std::cerr << "Error: num_put_threads must be >= 1" << std::endl;
+        return 1;
+    }
+    if ((workload == WorkloadType::GET_ALL || workload == WorkloadType::MIXED) && max_keys_per_put_thread <= 0) {
+        std::cerr << "Error: max_keys_per_put_thread must be >= 1" << std::endl;
+        return 1;
+    }
+    if (workload == WorkloadType::MIXED && (get_ratio + put_ratio) <= 0.0) {
+        std::cerr << "Error: get_ratio + put_ratio must be > 0" << std::endl;
+        return 1;
+    }
 
     std::cout << "Starting load test..." << std::endl;
     std::cout << "Target: " << server_ip << ":" << port << std::endl;
@@ -282,6 +316,7 @@ int main(int argc, char *argv[])
 
     std::cout << "Total Successful Requests: " << total_ops << std::endl;
     std::cout << "Total Errors:              " << errors << std::endl;
+    std::cout << "Total Not Found (404):     " << total_not_found.load() << std::endl;
     std::cout << "Error Rate:                " << error_rate << " %" << std::endl;
     std::cout << "Average Throughput:        " << avg_throughput << " req/sec" << std::endl;
     std::cout << "Average Response Time:     " << avg_latency_ms << " ms" << std::endl;
