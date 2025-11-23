@@ -1,325 +1,383 @@
-/*
- * server.cpp
- *
- * This file implements the HTTP-based KV server for the CS744 project.
- * It uses:
- * 1. cpp-httplib for the HTTP server
- * 2. A custom thread-safe LRUCache
- * 3. The MySQL C API for database persistence
- */
+// server.cpp
+// Option A - Thread-pool HTTP KV Server with Sharded LRU and MySQL pool
+// Build: g++ -std=c++17 server.cpp db.cpp -o server -lmysqlclient -lpthread
 
-// 1. INCLUDES
-
-// Now included from ../include/httplib.h
 #include "httplib.h"
+#include "db.hpp"
 
-// Standard C++ libraries
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <csignal>
+#include <cstring>
+#include <functional>
+#include <future>
+#include <iomanip>
 #include <iostream>
-#include <string>
-#include <list>
-#include <unordered_map>
-#include <mutex>
 #include <memory>
+#include <mutex>
+#include <optional>
+#include <queue>
+#include <random>
+#include <shared_mutex>
+#include <sstream>
 #include <stdexcept>
+#include <string>
+#include <thread>
+#include <tuple>
+#include <unordered_map>
+#include <vector>
 
-// MySQL C API
-#include <mysql/mysql.h>
+// --------------------------- Configuration -----------------------------------
+static int PORT = std::getenv("CS744_PORT") ? std::stoi(std::getenv("CS744_PORT")) : 8080;
+static int SHARD_COUNT = std::getenv("CS744_CACHE_SHARDS") ? std::stoi(std::getenv("CS744_CACHE_SHARDS")) : 16;
+static int CACHE_CAPACITY = std::getenv("CS744_CACHE") ? std::stoi(std::getenv("CS744_CACHE")) : 2000; // total items
+static int DB_POOL_SIZE = std::getenv("CS744_DBPOOL") ? std::stoi(std::getenv("CS744_DBPOOL")) : 8;
+static int WORKER_THREADS = std::getenv("CS744_WORKERS") ? std::stoi(std::getenv("CS744_WORKERS")) : std::thread::hardware_concurrency();
+static const char *DB_HOST = std::getenv("CS744_DB_HOST") ? std::getenv("CS744_DB_HOST") : "127.0.0.1";
+static const char *DB_USER = std::getenv("CS744_DB_USER") ? std::getenv("CS744_DB_USER") : "cs744_user";
+static const char *DB_PASS = std::getenv("CS744_DB_PASS") ? std::getenv("CS744_DB_PASS") : "123";
+static const char *DB_NAME = std::getenv("CS744_DB_NAME") ? std::getenv("CS744_DB_NAME") : "cs744_project";
 
-// --- Database Configuration ---
-// !! IMPORTANT: Change these values to match your MySQL setup !!
-#define DB_HOST "127.0.0.1"
-#define DB_USER "cs744_user"
-#define DB_PASS "123"
-#define DB_NAME "cs744_project"
-#define CACHE_CAPACITY 100 // Max number of items in the LRU cache
+// --------------------------- Utilities --------------------------------------
+using Clock = std::chrono::steady_clock;
+static inline long long now_us() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(Clock::now().time_since_epoch()).count();
+}
 
-// 2. THREAD-SAFE LRU CACHE IMPLEMENTATION
-
-class LRUCache
-{
-private:
-    size_t capacity;
-    std::list<std::pair<std::string, std::string>> items_list;
-    std::unordered_map<std::string, std::list<std::pair<std::string, std::string>>::iterator> items_map;
-    std::mutex mtx;
-
+// --------------------------- Thread Pool ------------------------------------
+class ThreadPool {
 public:
-    LRUCache(size_t cap) : capacity(cap) {}
-
-    bool get(const std::string &key, std::string &value)
-    {
-        std::lock_guard<std::mutex> lock(mtx);
-        auto it = items_map.find(key);
-        if (it == items_map.end())
-        {
-            return false;
-        }
-        items_list.splice(items_list.begin(), items_list, it->second);
-        value = it->second->second;
-        return true;
-    }
-
-    void put(const std::string &key, const std::string &value)
-    {
-        std::lock_guard<std::mutex> lock(mtx);
-        auto it = items_map.find(key);
-        if (it != items_map.end())
-        {
-            items_list.splice(items_list.begin(), items_list, it->second);
-            it->second->second = value;
-            return;
-        }
-        if (items_map.size() == capacity)
-        {
-            std::string lru_key = items_list.back().first;
-            items_list.pop_back();
-            items_map.erase(lru_key);
-        }
-        items_list.push_front({key, value});
-        items_map[key] = items_list.begin();
-    }
-
-    void del(const std::string &key)
-    {
-        std::lock_guard<std::mutex> lock(mtx);
-        auto it = items_map.find(key);
-        if (it != items_map.end())
-        {
-            items_list.erase(it->second);
-            items_map.erase(it);
+    ThreadPool(size_t n) : stop_flag(false) {
+        for (size_t i = 0; i < n; ++i) {
+            workers.emplace_back([this] {
+                while (true) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lk(mtx);
+                        cv.wait(lk, [this] { return stop_flag || !tasks.empty(); });
+                        if (stop_flag && tasks.empty()) return;
+                        task = std::move(tasks.front());
+                        tasks.pop();
+                    }
+                    try { task(); } catch (const std::exception &e) {
+                        std::cerr << "Worker task exception: " << e.what() << std::endl;
+                    } catch (...) {
+                        std::cerr << "Worker task unknown exception\n";
+                    }
+                }
+            });
         }
     }
+    ~ThreadPool() {
+        {
+            std::unique_lock<std::mutex> lk(mtx);
+            stop_flag = true;
+        }
+        cv.notify_all();
+        for (auto &t : workers) if (t.joinable()) t.join();
+    }
+    template<typename F>
+    auto submit(F&& f) -> std::future<decltype(f())> {
+        using R = decltype(f());
+        auto task_ptr = std::make_shared<std::packaged_task<R()>>(std::forward<F>(f));
+        std::future<R> fut = task_ptr->get_future();
+        {
+            std::unique_lock<std::mutex> lk(mtx);
+            tasks.emplace([task_ptr](){ (*task_ptr)(); });
+        }
+        cv.notify_one();
+        return fut;
+    }
+private:
+    std::vector<std::thread> workers;
+    std::queue<std::function<void()>> tasks;
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool stop_flag;
 };
 
-// 3. THREAD-SAFE DATABASE CONNECTION WRAPPER
+// --------------------------- Sharded LRU Cache -------------------------------
+class LRUShard {
+public:
+    using kv_t = std::pair<std::string, std::string>;
+    LRUShard(size_t cap) : capacity(cap) {}
 
-class DBConnection
-{
+    bool get(const std::string &key, std::string &val) {
+        std::shared_lock<std::shared_mutex> rlock(mux);
+        auto it = map.find(key);
+        if (it == map.end()) return false;
+        rlock.unlock();
+        std::unique_lock<std::shared_mutex> wlock(mux);
+        items.splice(items.begin(), items, it->second);
+        val = it->second->second;
+        return true;
+    }
+
+    void put(const std::string &key, const std::string &val) {
+        std::unique_lock<std::shared_mutex> wlock(mux);
+        auto it = map.find(key);
+        if (it != map.end()) {
+            items.splice(items.begin(), items, it->second);
+            it->second->second = val;
+            return;
+        }
+        if (map.size() >= capacity) {
+            auto &back = items.back();
+            map.erase(back.first);
+            items.pop_back();
+        }
+        items.emplace_front(key, val);
+        map[key] = items.begin();
+    }
+
+    void del(const std::string &key) {
+        std::unique_lock<std::shared_mutex> wlock(mux);
+        auto it = map.find(key);
+        if (it != map.end()) {
+            items.erase(it->second);
+            map.erase(it);
+        }
+    }
+
 private:
-    MYSQL *conn;
-    std::mutex mtx;
+    size_t capacity;
+    std::list<kv_t> items;
+    std::unordered_map<std::string, std::list<kv_t>::iterator> map;
+    mutable std::shared_mutex mux;
+};
 
-    std::string escape(const std::string &s)
+class ShardedLRU {
+public:
+    ShardedLRU(size_t total_capacity, int shards)
+        : shards_count(shards)
     {
-        if (!conn)
-            throw std::runtime_error("MySQL connection is null in escape()");
-        size_t in_len = s.length();
-        size_t out_len = in_len * 2 + 1;
-        char *out = new char[out_len];
-        unsigned long written = mysql_real_escape_string(conn, out, s.c_str(), in_len);
-        std::string escaped_s(out, written); // use actual length
-        delete[] out;
-        return escaped_s;
+        if (shards_count <= 0) shards_count = 1;
+        size_t per = std::max<size_t>(1, total_capacity / shards_count);
+        for (int i = 0; i < shards_count; ++i) {
+            parts.emplace_back(std::make_unique<LRUShard>(per));
+        }
     }
 
-    bool ensure_connected()
-    {
-        if (!conn)
-            return false;
-        if (mysql_ping(conn) == 0)
-        {
-            // Connection is alive
-            return true;
-        }
-
-        std::cerr << "MySQL connection lost, attempting reconnect..." << std::endl;
-        mysql_close(conn);
-        conn = mysql_init(NULL);
-        if (conn == NULL)
-        {
-            std::cerr << "Re-init failed during reconnect." << std::endl;
-            return false;
-        }
-
-        if (!mysql_real_connect(conn, DB_HOST, DB_USER, DB_PASS, DB_NAME, 0, NULL, 0))
-        {
-            std::cerr << "Reconnect failed: " << mysql_error(conn) << std::endl;
-            return false;
-        }
-
-        std::cout << "Reconnected to MySQL successfully." << std::endl;
-        return true;
+    bool get(const std::string &key, std::string &val) {
+        auto &sh = *parts[shard_of(key)];
+        return sh.get(key, val);
     }
 
-
-public : 
-    DBConnection()
-    {
-        conn = mysql_init(NULL);
-        if (conn == NULL)
-        {
-            throw std::runtime_error("MySQL Init failed");
-        }
-
-        if (mysql_real_connect(conn, DB_HOST, DB_USER, DB_PASS, DB_NAME, 0, NULL, 0) == NULL)
-        {
-            std::string error = "MySQL Connect failed: " + std::string(mysql_error(conn));
-            mysql_close(conn);
-            throw std::runtime_error(error);
-        }
-        std::cout << "Database connection successful." << std::endl;
+    void put(const std::string &key, const std::string &val) {
+        auto &sh = *parts[shard_of(key)];
+        sh.put(key, val);
     }
 
-    ~DBConnection()
-    {
-        mysql_close(conn);
+    void del(const std::string &key) {
+        auto &sh = *parts[shard_of(key)];
+        sh.del(key);
     }
 
-    bool db_get(const std::string &key, std::string &value)
-    {
-        std::lock_guard<std::mutex> lock(mtx);
-        if (!ensure_connected())
-        {
-            std::cerr << "DB connection not available for GET." << std::endl;
-            return false;
-        }
+    int shards() const { return shards_count; }
 
-        std::string query = "SELECT val FROM kv_store WHERE id = '" + escape(key) + "';";
-
-        if (mysql_query(conn, query.c_str()))
-        {
-            std::cerr << "DB GET query failed: " << mysql_error(conn) << std::endl;
-            return false;
-        }
-
-        MYSQL_RES *result = mysql_store_result(conn);
-        if (result == nullptr)
-        {
-            unsigned int err = mysql_errno(conn);
-            if (err != 0)
-            {
-                std::cerr << "DB GET store_result failed: " << mysql_error(conn) << std::endl;
-                return false;
-            }
-            // No rows found
-            return false;
-        }
-
-        bool found = false;
-        MYSQL_ROW row;
-        if ((row = mysql_fetch_row(result)))
-        {
-            if (row[0])
-            {
-                value = std::string(row[0]);
-                found = true;
-            }
-        }
-
-        mysql_free_result(result);
-        return found;
+private:
+    size_t shard_of(const std::string &key) const {
+        return std::hash<std::string>{}(key) % shards_count;
     }
+    int shards_count;
+    std::vector<std::unique_ptr<LRUShard>> parts;
+};
 
-    bool db_put(const std::string &key, const std::string &value)
-    {
-        std::lock_guard<std::mutex> lock(mtx);
-        if (!ensure_connected())
-        {
-            std::cerr << "DB connection not available for GET." << std::endl;
-            return false;
-        }
-        std::string query = "INSERT INTO kv_store (id, val) VALUES ('" +
-                            escape(key) + "', '" + escape(value) +
-                            "') ON DUPLICATE KEY UPDATE val = '" + escape(value) + "';";
+// --------------------------- Global metrics ----------------------------------
+static std::atomic<long long> g_total_requests(0);
+static std::atomic<long long> g_total_success(0);
+static std::atomic<long long> g_total_errors(0);
+static std::atomic<long long> g_total_not_found(0);
+static std::atomic<long long> g_cache_hits(0);
+static std::atomic<long long> g_cache_misses(0);
+static std::atomic<long long> g_db_reads(0);
+static std::atomic<long long> g_db_writes(0);
+static std::atomic<long long> g_db_deletes(0);
 
-        if (mysql_query(conn, query.c_str()))
-        {
-            std::cerr << "DB PUT query failed: " << mysql_error(conn) << std::endl;
-            return false;
-        }
-        return true;
-    }
+// --------------------------- Main --------------------------------------------
+std::atomic<bool> keep_running{true};
 
-    bool db_del(const std::string &key)
-    {
-        std::lock_guard<std::mutex> lock(mtx);
-        if (!ensure_connected())
-        {
-            std::cerr << "DB connection not available for GET." << std::endl;
-            return false;
-        }
-        std::string query = "DELETE FROM kv_store WHERE id = '" + escape(key) + "';";
-
-        if (mysql_query(conn, query.c_str()))
-        {
-            std::cerr << "DB DELETE query failed: " << mysql_error(conn) << std::endl;
-            return false;
-        }
-        return true;
-    }
+void signal_handler(int) {
+    keep_running.store(false);
 }
-;
 
-// 4. MAIN SERVER LOGIC
+int main(int argc, char **argv) {
+    std::signal(SIGINT, signal_handler);
+    std::signal(SIGTERM, signal_handler);
 
-int main()
-{
+    // print config
+    std::cout << "Starting server on port " << PORT
+              << " | workers=" << WORKER_THREADS
+              << " | shards=" << SHARD_COUNT
+              << " | cache=" << CACHE_CAPACITY
+              << " | dbpool=" << DB_POOL_SIZE << std::endl;
+
+    // create pieces
+    ThreadPool pool(std::max<int>(1, WORKER_THREADS));
+    ShardedLRU cache(CACHE_CAPACITY, SHARD_COUNT);
+
+    // construct DB pool using env vars (db.hpp provides class)
+    MySQLPool dbpool(DB_HOST, DB_USER, DB_PASS, DB_NAME, DB_POOL_SIZE);
+
     using namespace httplib;
+    Server svr;
 
-    try
-    {
-        Server svr;
-        LRUCache cache(CACHE_CAPACITY);
-        DBConnection db;
+    // Helper: run a blocking job in the thread pool and return future
+    auto enqueue_job = [&](auto job)->auto {
+        return pool.submit(job);
+    };
 
-        svr.Post("/kv", [&](const Request &req, Response &res)
-                 {
-            if (!req.has_param("key") || !req.has_param("val")) {
-                res.status = 400; 
-                res.set_content("Missing 'key' or 'val' parameter", "text/plain");
-                return;
+    // POST /kv : create or update
+    svr.Post("/kv", [&](const Request &req, Response &res) {
+        g_total_requests++;
+        if (!req.has_param("key") || !req.has_param("val")) {
+            res.status = 400;
+            res.set_content("Missing 'key' or 'val'", "text/plain");
+            return;
+        }
+        std::string key = req.get_param_value("key");
+        std::string val = req.get_param_value("val");
+
+        // enqueue a job that does db_put + cache put
+        auto fut = enqueue_job([&cache, &dbpool, key, val]() -> bool {
+            auto [idx, conn] = dbpool.acquire();
+            bool ok = db_put_raw(conn, key, val);
+            dbpool.release(idx);
+            if (ok) {
+                cache.put(key, val);
+                g_db_writes++;
             }
-            std::string key = req.get_param_value("key");
-            std::string val = req.get_param_value("val");
+            return ok;
+        });
 
-            if (!db.db_put(key, val)) {
-                res.status = 500; 
-                res.set_content("Database write failed", "text/plain");
-                return;
+        bool ok = false;
+        try { ok = fut.get(); }
+        catch (...) { ok = false; }
+
+        if (!ok) {
+            g_total_errors++;
+            res.status = 500;
+            res.set_content("Database write failed", "text/plain");
+            return;
+        }
+        g_total_success++;
+        res.status = 201;
+        res.set_content("Created", "text/plain");
+    });
+
+    // GET /kv/<key>
+    svr.Get(R"(/kv/([a-zA-Z0-9_\-]+))", [&](const Request &req, Response &res) {
+        g_total_requests++;
+        std::string key = req.matches[1];
+        std::string val;
+
+        // Fast-path: try cache in-line (this only takes shared locks per shard)
+        if (cache.get(key, val)) {
+            g_cache_hits++;
+            g_total_success++;
+            res.set_header("X-Cache-Status", "HIT");
+            res.set_content(val, "text/plain");
+            return;
+        }
+
+        // Cache miss: enqueue DB read + cache insert
+        auto fut = enqueue_job([&cache, &dbpool, key]() -> std::tuple<bool,std::string> {
+            auto [idx, conn] = dbpool.acquire();
+            std::string v;
+            bool ok = db_get_raw(conn, key, v);
+            dbpool.release(idx);
+            if (ok) {
+                cache.put(key, v);
             }
-            cache.put(key, val);
+            return std::make_tuple(ok, v);
+        });
 
-            res.status = 201; 
-            res.set_content("Created", "text/plain"); });
+        bool ok = false;
+        std::string v;
+        try {
+            auto tup = fut.get();
+            ok = std::get<0>(tup);
+            v = std::get<1>(tup);
+        } catch (...) { ok = false; }
 
-        svr.Get(R"(/kv/([a-zA-Z0-9_-]+))", [&](const Request &req, Response &res)
-                {
-            std::string key = req.matches[1];
-            std::string value;
+        if (ok) {
+            g_cache_misses++;
+            g_db_reads++;
+            g_total_success++;
+            res.set_header("X-Cache-Status", "MISS");
+            res.set_content(v, "text/plain");
+        } else {
+            g_total_not_found++;
+            res.status = 404;
+            res.set_content("Key not found", "text/plain");
+        }
+    });
 
-            if (cache.get(key, value)) {
-                res.set_header("X-Cache-Status", "HIT");
-                res.set_content(value, "text/plain");
-                return;
-            }
+    // DELETE /kv/<key>
+    svr.Delete(R"(/kv/([a-zA-Z0-9_\-]+))", [&](const Request &req, Response &res) {
+        g_total_requests++;
+        std::string key = req.matches[1];
+        auto fut = enqueue_job([&cache, &dbpool, key]() -> bool {
+            auto [idx, conn] = dbpool.acquire();
+            bool ok = db_del_raw(conn, key);
+            dbpool.release(idx);
+            if (ok) cache.del(key);
+            return ok;
+        });
 
-            if (db.db_get(key, value)) {
-                cache.put(key, value);
-                res.set_header("X-Cache-Status", "MISS");
-                res.set_content(value, "text/plain");
-            } else {
-                res.status = 404; 
-                res.set_content("Key not found", "text/plain");
-            } });
+        bool ok = false;
+        try { ok = fut.get(); } catch (...) { ok = false; }
 
-        svr.Delete(R"(/kv/([a-zA-Z0-9_-]+))", [&](const Request &req, Response &res)
-                   {
-            std::string key = req.matches[1];
-            if (!db.db_del(key)) {
-                res.status = 500;
-                res.set_content("Database delete failed", "text/plain");
-                return;
-            }
-            cache.del(key);
-            res.set_content("Deleted", "text/plain"); });
+        if (!ok) {
+            g_total_errors++;
+            res.status = 500;
+            res.set_content("DB delete failed", "text/plain");
+            return;
+        }
+        g_db_deletes++;
+        g_total_success++;
+        res.status = 200;
+        res.set_content("Deleted", "text/plain");
+    });
 
-        std::cout << "Starting server on http://0.0.0.0:8080..." << std::endl;
-        svr.listen("0.0.0.0", 8080);
+    // /metrics endpoint (JSON)
+    svr.Get("/metrics", [&](const Request&, Response& res) {
+        std::ostringstream out;
+        out << "{\n";
+        out << "  \"requests\": " << g_total_requests.load() << ",\n";
+        out << "  \"success\": " << g_total_success.load() << ",\n";
+        out << "  \"errors\": " << g_total_errors.load() << ",\n";
+        out << "  \"not_found\": " << g_total_not_found.load() << ",\n";
+        out << "  \"cache_hits\": " << g_cache_hits.load() << ",\n";
+        out << "  \"cache_misses\": " << g_cache_misses.load() << ",\n";
+        out << "  \"db_reads\": " << g_db_reads.load() << ",\n";
+        out << "  \"db_writes\": " << g_db_writes.load() << ",\n";
+        out << "  \"db_deletes\": " << g_db_deletes.load() << ",\n";
+        out << "  \"db_pool_in_use\": " << dbpool.in_use() << ",\n";
+        out << "  \"db_pool_acquire_count\": " << dbpool.db_pool_acquire_count.load() << ",\n";
+        out << "  \"db_pool_acquire_wait_us_sum\": " << dbpool.db_pool_acquire_wait_us.load() << ",\n";
+        out << "  \"db_pool_acquire_wait_us_max\": " << dbpool.db_pool_acquire_wait_max_us.load() << ",\n";
+        out << "  \"cache_shards\": " << cache.shards() << "\n";
+        out << "}\n";
+        res.set_content(out.str(), "application/json");
+    });
+
+    // Start server (listen)
+    std::thread server_thread([&] {
+        svr.listen("0.0.0.0", PORT);
+    });
+
+    // Wait for signal
+    while (keep_running.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
-    catch (const std::exception &e)
-    {
-        std::cerr << "Fatal Error: " << e.what() << std::endl;
-        return 1;
-    }
+
+    std::cerr << "Shutdown requested; stopping server..." << std::endl;
+    svr.stop();
+    if (server_thread.joinable()) server_thread.join();
+
+    std::cout << "Server stopped gracefully." << std::endl;
     return 0;
 }

@@ -12,7 +12,7 @@ CPPFLAGS = -Isrc/include
 LDFLAGS = -lpthread -lssl -lcrypto
 
 # --- Server Specific ---
-SERVER_SRC = src/server/server.cpp
+SERVER_SRC = src/server/server.cpp src/server/db.cpp
 SERVER_TARGET = build/server
 # Server needs the mysql client library
 SERVER_LIBS = -lmysqlclient
