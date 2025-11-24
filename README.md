@@ -22,16 +22,16 @@ decs-project/
 │   ├── client/
 │   │   └── client.cpp
 │   ├── server/
-│   │   └── server.cpp
+│   │   ├── server.cpp
+│   │   └── db.cpp
 │   └── include/
-│       └── httplib.h
-│
+│       ├── httplib.h
+│       └── db.hpp
 ├── build/
-│   ├── (compiled binaries: server, client)
-│
 ├── Makefile
 ├── .gitignore
 └── README.md
+
 ```
 
 ---
@@ -88,7 +88,7 @@ EXIT;
 
 ## 5. System Architecture
 
-![HTTP Client Server FlowChart](html-client-server.png)
+![HTTP Client Server FlowChart](arch.png)
 
 > The KV store has a client, a cache, and a database connected through an HTTP server.
 
@@ -117,23 +117,17 @@ EXIT;
 ### Command Format
 
 ```bash
-./client <server_ip> <port> <num_threads> <duration_sec> <workload_type> [num_put_threads] [max_keys_per_put_thread] [get_ratio put_ratio]
+./client <server_ip> <port> run <num_threads> <duration_sec> <workload_type> [key_space_params] [mixed_ratio_params] [options]
 ```
 
 ### Parameters
 
-| Parameter                 | Description                                                  | Example     |
-| ------------------------- | ------------------------------------------------------------ | ----------- |
-| `server_ip`               | IP address of the KV server                                  | `127.0.0.1` |
-| `port`                    | Port number where the server listens                         | `8080`      |
-| `num_threads`             | Number of client threads                                     | `4`         |
-| `duration_sec`            | Duration of the test (excluding 5s warm-up)                  | `30`        |
-| `workload_type`           | One of: `PUT_ALL`, `GET_ALL`, `GET_POPULAR`, `MIXED`         | `MIXED`     |
-| `num_put_threads`         | Number of threads used for PUT_ALL (for GET/MIXED workloads) | `4`         |
-| `max_keys_per_put_thread` | Number of keys each PUT thread generates                     | `1000`      |
-| `get_ratio`               | Ratio of GET operations in MIXED workload                    | `8`         |
-| `put_ratio`               | Ratio of PUT operations in MIXED workload                    | `2`         |
-
+| Workload Type | Key Space Parameters | Mixed Ratio Parameters | Example Command |
+| :--- | :--- | :--- | :--- |
+| **`PUT_ALL`** | None | None | `./client 127.0.0.1 8080 run 32 30 PUT_ALL` |
+| **`GET_ALL`** | `<num_put_threads> <max_keys_per_put_thread>` | None | `./client 127.0.0.1 8080 run 32 60 GET_ALL 4 1000` |
+| **`GET_POPULAR`** | `<num_put_threads> <max_keys_per_put_thread>` | None | `./client 127.0.0.1 8080 run 32 60 GET_POPULAR` |
+| **`MIXED`** | `<num_put_threads> <max_keys_per_put_thread>` | `<get_ratio> <put_ratio>` | `./client 127.0.0.1 8080 run 64 120 MIXED 4 1000 3 1` |
 ---
 
 ## 8. Manual Testing using curl
@@ -156,70 +150,42 @@ curl -X DELETE http://127.0.0.1:8080/kv/key1
 
 ---
 
-### Example Commands
-* Start the server in a separate terminal
-* Pin it to one physical core (two hyperthreads in the machine considered for test)
-```taskset -c 0,1 ./server```
 
-* In another terminal, run the client pinned to a different core
-```
-#Populate the database with PUT requests
-taskset -c 4,5 ./client 127.0.0.1 8080 4 30 PUT_ALL
-
-#Read frequently accessed keys (cache-intensive)
-taskset -c 4,5 ./client 127.0.0.1 8080 4 30 GET_POPULAR
-
-#Read all keys uniformly (DB-heavy workload)
-taskset -c 4,5 ./client 127.0.0.1 8080 4 30 GET_ALL 4 1000
-
-#Mixed workload: 80% GET, 20% PUT
-taskset -c 4,5 ./client 127.0.0.1 8080 4 30 MIXED 4 1000 8 2
-```
 ---
 
 ## 8. Example Output
-
 ```
-Starting load test...
-Target: 127.0.0.1:8080
-Threads: 4
-Duration: 30 seconds (+ 5s warmup)
-Workload: MIXED
-Reading keys from 4 PUT_ALL threads, 1000 keys each.
-Request Mix: 80% GET, 20% PUT
+Server: 127.0.0.1:8080
+Threads: 512, Duration: 300s (+ warmup 5s)
+Workload: GET_POPULAR
+Using deterministic seed: 42
+----------------------------------------
 ----------------------------------------
 Load Test Complete
 ----------------------------------------
-Total Successful Requests: 2283
-Total Errors:              0
-Total Not Found (404):     4933
-Error Rate:                0 %
-Average Throughput:        76.1 req/sec
-Average Response Time:     26.47 ms
+{
+  "server": "127.0.0.1:8080",
+  "threads": 512,
+  "duration_sec": 300,
+  "warmup_sec": 5,
+  "workload": "GET_POPULAR",
+  "num_put_threads": 4,
+  "max_keys_per_put_thread": 10000,
+  "total_success": 113428,
+  "total_errors": 0,
+  "total_not_found": 0,
+  "cache_hits": 95249,
+  "cache_misses": 18179,
+  "throughput_req_per_sec": 378.093,
+  "avg_latency_ms": 1376.822,
+  "p50_ms": 41.010,
+  "p95_ms": 42.098,
+  "p99_ms": 65903.025,
+  "csv_path": ""
+}
 ```
-
 ---
 
-## 9. Results Summary
-
-
-| Workload                      | Throughput (req/s) | Avg Response Time (ms) | Successful Requests | Not Found (404) | Notes                 |
-| ----------------------------- | -----------------: | ---------------------: | ------------------: | --------------: | --------------------- |
-| **PUT_ALL**                   |              49.07 |                  81.74 |                1472 |               0 | Write-heavy, DB-bound |
-| **GET_POPULAR**               |              97.07 |                  36.40 |                2912 |             431 | Cache hits dominate   |
-| **GET_ALL**                   |              94.47 |                  17.53 |                2834 |            4506 | Cold-cache DB reads   |
-| **MIXED (80% GET / 20% PUT)** |              79.20 |                  30.93 |                2376 |            2321 | Balanced workload     |
----
-
-### Observations:
-
-* Throughput improves significantly for cache-friendly workloads (GET_POPULAR).
-* PUT-heavy workloads are bottlenecked by MySQL writes.
-* Mixed workload performance remains stable under concurrent load.
-* 404s mainly arise from GET requests for keys that were not yet inserted.
-* No request errors or connection failures were observed across all tests.
-
----
 
 ## 10. References
 
